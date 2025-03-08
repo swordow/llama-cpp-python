@@ -43,13 +43,14 @@ import llama_cpp.llama_cpp as llama_cpp
 import llama_cpp.llama_chat_format as llama_chat_format
 
 from llama_cpp.llama_speculative import LlamaDraftModel
-
+from llama_cpp.llama_embedding import llama_batch_decode
 import numpy as np
 import numpy.typing as npt
 
 import llama_cpp._internals as internals
 from ._logger import set_verbose
 from ._utils import suppress_stdout_stderr
+from llama_cpp import llama_types
 
 
 class Llama:
@@ -444,6 +445,9 @@ class Llama:
         self._chat_handlers: Dict[
             str, llama_chat_format.LlamaChatCompletionHandler
         ] = {}
+        self._char_formaters: Dict[
+            str, llama_chat_format.ChatFormatter
+        ] = {}
 
         self.draft_model = draft_model
 
@@ -504,12 +508,13 @@ class Llama:
             )
 
         for name, template in template_choices.items():
-            self._chat_handlers[name] = llama_chat_format.Jinja2ChatFormatter(
+            self._char_formaters[name] = llama_chat_format.Jinja2ChatFormatter(
                 template=template,
                 eos_token=eos_token,
                 bos_token=bos_token,
                 stop_token_ids=[eos_token_id],
-            ).to_chat_handler()
+            )
+            self._chat_handlers[name] = self._char_formaters[name].to_chat_handler()
 
         if (
             self.chat_format is None
@@ -570,6 +575,27 @@ class Llama:
             self.scores[: self.n_tokens, :].tolist(),
             maxlen=self._n_ctx if self.context_params.logits_all else 1,
         )
+
+    # from Jinja2ChatFormatter.to_chat_handler
+    def apply_chat_format(self, messages: List[llama_types.ChatCompletionRequestMessage],
+        functions: Optional[List[llama_types.ChatCompletionFunction]] = None,
+        function_call: Optional[llama_types.ChatCompletionRequestFunctionCall] = None,
+        tools: Optional[List[llama_types.ChatCompletionTool]] = None,
+        tool_choice: Optional[llama_types.ChatCompletionToolChoiceOption] = None):
+        result: llama_chat_format.ChatFormatterResponse
+        result = self._char_formaters[self.chat_format](
+            messages=messages,
+            functions=functions,
+            function_call=function_call,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        prompt = self.tokenize(
+            result.prompt.encode("utf-8"),
+            add_bos=not result.added_special,
+            special=True,
+        )
+        return prompt
 
     def tokenize(
         self, text: bytes, add_bos: bool = True, special: bool = False
@@ -958,7 +984,7 @@ class Llama:
                 )
 
     def create_embedding(
-        self, input: Union[str, List[str]], model: Optional[str] = None
+        self, input: Union[str, List[str]], normalize: Optional[bool] = True, model: Optional[str] = None
     ) -> CreateEmbeddingResponse:
         """Embed a string.
 
@@ -975,7 +1001,7 @@ class Llama:
         # get numeric embeddings
         embeds: Union[List[List[float]], List[List[List[float]]]]
         total_tokens: int
-        embeds, total_tokens = self.embed(input, return_count=True)  # type: ignore
+        embeds, total_tokens = self.embed(input, normalize, return_count=True)  # type: ignore
 
         # convert to CreateEmbeddingResponse
         data: List[Embedding] = [
@@ -1017,7 +1043,7 @@ class Llama:
 
         # get pooling information
         pooling_type = self.pooling_type()
-        logits_all = pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE
+        #logits_all = pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE
 
         if self.context_params.embeddings is False:
             raise RuntimeError(
@@ -1036,49 +1062,51 @@ class Llama:
         self._batch.reset()
 
         # decode and fetch embeddings
-        data: Union[List[List[float]], List[List[List[float]]]] = []
+        data: List[List[float]] = []
 
-        def decode_batch(seq_sizes: List[int]):
-            llama_cpp.llama_kv_cache_clear(self._ctx.ctx)
-            self._ctx.decode(self._batch)
-            self._batch.reset()
-
+        def decode_batch(seq_sizes: List[int], ptr): # type: ignore
             # store embeddings
             if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
                 pos: int = 0
                 for i, size in enumerate(seq_sizes):
-                    ptr = llama_cpp.llama_get_embeddings(self._ctx.ctx)
                     embedding: List[List[float]] = [
                         ptr[pos + j * n_embd : pos + (j + 1) * n_embd]
                         for j in range(size)
                     ]
-                    if normalize:
-                        embedding = [
-                            internals.normalize_embedding(e) for e in embedding
-                        ]
                     data.append(embedding)
                     pos += size
             else:
                 for i in range(len(seq_sizes)):
-                    ptr = llama_cpp.llama_get_embeddings_seq(self._ctx.ctx, i)
-                    embedding: List[float] = ptr[:n_embd]
-                    if normalize:
-                        embedding = internals.normalize_embedding(embedding)
+                    embedding: List[float] = ptr[i*n_embd:(i+1)*n_embd]
                     data.append(embedding)
 
         # init state
         total_tokens = 0
         s_batch = []
-        t_batch = 0
         p_batch = 0
 
         # accumulate batches and encode
+        text_tokens = []
+        n_embd_count = 0
         for text in inputs:
-            tokens = self.tokenize(text.encode("utf-8"))
+            tokens = self.tokenize(text.encode("utf-8"),add_bos=False)
             if truncate:
                 tokens = tokens[:n_batch]
 
-            n_tokens = len(tokens)
+            text_tokens.append(tokens)
+
+        if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+            for i in range(len(text_tokens)):
+                n_embd_count += len(text_tokens[i])
+        else:
+            n_embd_count = len(text_tokens)
+
+        c_embeddings = ctypes.c_float*(n_embd_count*n_embd)
+        embeddings = c_embeddings(0.0)
+        embd_offset = 0
+        for i in range(len(text_tokens)):
+            n_tokens = len(text_tokens[i])
+            tokens = text_tokens[i]
             total_tokens += n_tokens
 
             # check for overrun
@@ -1088,22 +1116,30 @@ class Llama:
                 )
 
             # time to eval batch
-            if t_batch + n_tokens > n_batch:
-                decode_batch(s_batch)
+            if self._batch.n_tokens() + n_tokens > n_batch:
+                embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float)*embd_offset*n_embd),ctypes.POINTER(ctypes.c_float))
+                if not llama_batch_decode(self._ctx.ctx, self._batch.batch, p_batch, n_embd, 2, embeddings_ptr):
+                    raise RuntimeError("llama_batch_decode return false")
+                decode_batch(s_batch,embeddings_ptr)
+                embd_offset += self._batch.n_tokens if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE else p_batch
+                self._batch.reset()
                 s_batch = []
-                t_batch = 0
                 p_batch = 0
 
             # add to batch
-            self._batch.add_sequence(tokens, p_batch, logits_all)
+            self._batch.add_sequence(tokens, p_batch, True)
 
             # update batch stats
             s_batch.append(n_tokens)
-            t_batch += n_tokens
             p_batch += 1
 
         # hanlde last batch
-        decode_batch(s_batch)
+        embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float)*embd_offset*n_embd),ctypes.POINTER(ctypes.c_float))
+        if not llama_batch_decode(
+            self._ctx.ctx, self._batch.batch, p_batch, n_embd, 2, embeddings_ptr):
+             raise RuntimeError("llama_batch_decode return false")
+        decode_batch(s_batch,embeddings_ptr)
+        self._batch.reset()
 
         if self.verbose:
             llama_cpp.llama_perf_context_print(self._ctx.ctx)
@@ -1238,9 +1274,10 @@ class Llama:
 
         if prompt_tokens[:2] == [self.token_bos()] * 2:
             warnings.warn(
-                f'Detected duplicate leading "{self._model.token_get_text(self.token_bos())}" in prompt, this will likely reduce response quality, consider removing it...',
+                f'Detected duplicate leading "{self._model.token_get_text(self.token_bos())}" in prompt, this will likely reduce response quality, removing it...',
                 RuntimeWarning,
             )
+            prompt_tokens[1:]
 
         # NOTE: This likely doesn't work correctly for the first token in the prompt
         # because of the extra space added to the start of the prompt_tokens

@@ -132,6 +132,20 @@ if (LLAMA_BUILD)
         )
     endif()
 
+    add_subdirectory(vendor/llama.cpp/examples/embedding)
+    set_target_properties(llama-embedding PROPERTIES OUTPUT_NAME "llama-embedding")
+    llama_cpp_python_install_target(llama-embedding)
+    if (WIN32)
+        install(
+            FILES $<TARGET_RUNTIME_DLLS:llama-embedding>
+            DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/lib
+        )
+        install(
+            FILES $<TARGET_RUNTIME_DLLS:llama-embedding>
+            DESTINATION ${SKBUILD_PLATLIB_DIR}/llama_cpp/lib
+        )
+    endif()
+
     if (LLAVA_BUILD)
         if (LLAMA_CUBLAS OR LLAMA_CUDA)
             add_compile_definitions(GGML_USE_CUBLAS)
