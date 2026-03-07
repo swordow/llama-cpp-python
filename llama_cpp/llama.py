@@ -1278,7 +1278,7 @@ class Llama:
                 f'Detected duplicate leading "{self._model.token_get_text(self.token_bos())}" in prompt, this will likely reduce response quality, removing it...',
                 RuntimeWarning,
             )
-            prompt_tokens[1:]
+            prompt_tokens = prompt_tokens[1:]
 
         # NOTE: This likely doesn't work correctly for the first token in the prompt
         # because of the extra space added to the start of the prompt_tokens
