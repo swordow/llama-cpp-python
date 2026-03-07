@@ -1075,7 +1075,7 @@ class Llama:
                         for j in range(size)
                     ]
                     data.append(embedding)
-                    pos += size
+                    pos += size * n_embd
             else:
                 for i in range(len(seq_sizes)):
                     embedding: List[float] = ptr[i*n_embd:(i+1)*n_embd]
@@ -1102,6 +1102,7 @@ class Llama:
         else:
             n_embd_count = len(text_tokens)
 
+        n_norm = 2 if normalize else 0
         c_embeddings = ctypes.c_float * (n_embd_count * n_embd)
         embeddings = c_embeddings(0.0)
         embd_offset = 0
@@ -1119,10 +1120,10 @@ class Llama:
             # time to eval batch
             if self._batch.n_tokens() + n_tokens > n_batch:
                 embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd), ctypes.POINTER(ctypes.c_float))
-                if not llama_batch_decode(self._ctx.ctx, self._batch.batch, p_batch, n_embd, 2, embeddings_ptr):
+                if not llama_batch_decode(self._ctx.ctx, self._batch.batch, p_batch, n_embd, n_norm, embeddings_ptr):
                     raise RuntimeError("llama_batch_decode return false")
                 decode_batch(s_batch, embeddings_ptr)
-                embd_offset += self._batch.n_tokens if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE else p_batch
+                embd_offset += self._batch.n_tokens() if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE else p_batch
                 self._batch.reset()
                 s_batch = []
                 p_batch = 0
@@ -1137,7 +1138,7 @@ class Llama:
         # hanlde last batch
         embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd), ctypes.POINTER(ctypes.c_float))
         if not llama_batch_decode(
-            self._ctx.ctx, self._batch.batch, p_batch, n_embd, 2, embeddings_ptr
+            self._ctx.ctx, self._batch.batch, p_batch, n_embd, n_norm, embeddings_ptr
         ):
             raise RuntimeError("llama_batch_decode return false")
         decode_batch(s_batch, embeddings_ptr)
