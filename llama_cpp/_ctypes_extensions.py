@@ -53,12 +53,30 @@ def load_shared_library(lib_base_name: str, base_path: pathlib.Path):
     if sys.platform == "win32" and sys.version_info >= (3, 8):
         os.add_dll_directory(str(base_path))
         if "CUDA_PATH" in os.environ:
-            os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "bin"))
-            os.add_dll_directory(os.path.join(os.environ["CUDA_PATH"], "lib"))
+            cuda_bin = os.path.join(os.environ["CUDA_PATH"], "bin")
+            cuda_bin_x64 = os.path.join(cuda_bin, "x64")
+            cuda_lib = os.path.join(os.environ["CUDA_PATH"], "lib")
+            if os.path.isdir(cuda_bin):
+                os.add_dll_directory(cuda_bin)
+            if os.path.isdir(cuda_bin_x64):
+                os.add_dll_directory(cuda_bin_x64)
+            if os.path.isdir(cuda_lib):
+                os.add_dll_directory(cuda_lib)
         if "HIP_PATH" in os.environ:
             os.add_dll_directory(os.path.join(os.environ["HIP_PATH"], "bin"))
             os.add_dll_directory(os.path.join(os.environ["HIP_PATH"], "lib"))
         cdll_args["winmode"] = ctypes.RTLD_GLOBAL
+
+    # On Windows, preload dependency DLLs from base_path to resolve transitive deps
+    if sys.platform == "win32":
+        _dep_load_order = ["ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll"]
+        for dep_name in _dep_load_order:
+            dep_path = base_path / dep_name
+            if dep_path.exists():
+                try:
+                    ctypes.CDLL(str(dep_path))
+                except Exception:
+                    pass  # Non-fatal: dependency may not be needed
 
     # Try to load the shared library, handling potential errors
     for lib_path in lib_paths:
@@ -110,7 +128,14 @@ def ctypes_function_for_shared_library(lib: ctypes.CDLL):
     ):
         def decorator(f: F) -> F:
             if enabled:
-                func = getattr(lib, name)
+                try:
+                    func = getattr(lib, name)
+                except AttributeError:
+                    # Symbol not found in DLL — return a stub that raises at call time
+                    @functools.wraps(f)
+                    def _missing_func(*args, **kwargs):
+                        raise RuntimeError(f"Function '{name}' not found in shared library")
+                    return _missing_func  # type: ignore
                 func.argtypes = argtypes
                 func.restype = restype
                 functools.wraps(f)(func)

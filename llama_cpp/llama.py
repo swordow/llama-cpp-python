@@ -43,7 +43,8 @@ import llama_cpp.llama_cpp as llama_cpp
 import llama_cpp.llama_chat_format as llama_chat_format
 
 from llama_cpp.llama_speculative import LlamaDraftModel
-from llama_cpp.llama_embedding import llama_batch_decode
+# llama_batch_decode from llama_embedding.dll is no longer needed
+# embedding now uses llama_encode + llama_get_embeddings_seq from llama.dll
 
 import numpy as np
 import numpy.typing as npt
@@ -91,6 +92,7 @@ class Llama:
         yarn_orig_ctx: int = 0,
         logits_all: bool = False,
         embedding: bool = False,
+        n_seq_max: Optional[int] = None,
         offload_kqv: bool = True,
         flash_attn: bool = False,
         op_offload: Optional[bool] = None,
@@ -341,8 +343,11 @@ class Llama:
         self.context_params.yarn_orig_ctx = yarn_orig_ctx if yarn_orig_ctx != 0 else 0
         self._logits_all = logits_all if draft_model is None else True
         self.context_params.embeddings = embedding  # TODO: Rename to embeddings
+        if n_seq_max is not None:
+            self.context_params.n_seq_max = n_seq_max
         self.context_params.offload_kqv = offload_kqv
-        self.context_params.flash_attn = flash_attn
+        # flash_attn bool -> flash_attn_type enum: True=1(ENABLED), False=0(DISABLED)
+        self.context_params.flash_attn_type = int(flash_attn)
 
         if op_offload is not None:
             self.context_params.op_offload = op_offload
@@ -1035,16 +1040,27 @@ class Llama:
 
         Args:
             input: The utf-8 encoded string to embed.
+            normalize: Whether to L2-normalize the embeddings.
+            truncate: Whether to truncate tokens to n_batch.
+            return_count: Whether to also return the total token count.
 
         Returns:
-            A list of embeddings
+            A list of embeddings (or a single embedding if input is a string).
+
+        Notes:
+            Uses llama_batch_decode from llama-embedding DLL which handles:
+            - KV cache clearing
+            - Encoder/decoder model selection (encode for encoder-only, decode for decoder-only)
+            - Embedding extraction and normalization
+            When n_seq_max > 1, multiple sequences can be batched in one call.
+            When n_seq_max == 1 (default), sequences are processed one at a time.
         """
         n_embd = self.n_embd()
         n_batch = self.n_batch
+        n_seq_max = self.context_params.n_seq_max
 
         # get pooling information
         pooling_type = self.pooling_type()
-        #logits_all = pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE
 
         if self.context_params.embeddings is False:
             raise RuntimeError(
@@ -1059,89 +1075,85 @@ class Llama:
         else:
             inputs = input
 
-        # reset batch
-        self._batch.reset()
-
-        # decode and fetch embeddings
-        data: List[List[float]] = []
-
-        def decode_batch(seq_sizes: List[int], ptr): # type: ignore
-            # store embeddings
-            if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
-                pos: int = 0
-                for i, size in enumerate(seq_sizes):
-                    embedding: List[List[float]] = [
-                        ptr[pos + j * n_embd : pos + (j + 1) * n_embd]
-                        for j in range(size)
-                    ]
-                    data.append(embedding)
-                    pos += size * n_embd
-            else:
-                for i in range(len(seq_sizes)):
-                    embedding: List[float] = ptr[i*n_embd:(i+1)*n_embd]
-                    data.append(embedding)
-
-        # init state
-        total_tokens = 0
-        s_batch = []
-        p_batch = 0
-
-        # accumulate batches and encode
+        # tokenize all inputs
         text_tokens = []
-        n_embd_count = 0
         for text in inputs:
             tokens = self.tokenize(text.encode("utf-8"), add_bos=False)
             if truncate:
                 tokens = tokens[:n_batch]
-
             text_tokens.append(tokens)
 
+        # collect embeddings
+        data: List[List[float]] = []
+        total_tokens = 0
+
+        # llama_batch_decode from llama-embedding DLL handles:
+        # memory clear, encode/decode selection, embedding extraction, normalization
+        from llama_cpp.llama_embedding import llama_batch_decode
+
         if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
-            for i in range(len(text_tokens)):
-                n_embd_count += len(text_tokens[i])
+            n_embd_count = sum(len(t) for t in text_tokens)
         else:
             n_embd_count = len(text_tokens)
 
         n_norm = 2 if normalize else 0
-        c_embeddings = ctypes.c_float * (n_embd_count * n_embd)
-        embeddings = c_embeddings(0.0)
+        c_embeddings = (ctypes.c_float * (n_embd_count * n_embd))()
+
+        # reset batch
+        self._batch.reset()
+        s_batch: List[int] = []
+        p_batch = 0
         embd_offset = 0
+
+        def decode_batch(seq_sizes, ptr):
+            if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+                pos = 0
+                for size in seq_sizes:
+                    embedding = [ptr[pos + j * n_embd : pos + (j + 1) * n_embd] for j in range(size)]
+                    data.append(embedding)
+                    pos += size * n_embd
+            else:
+                for i in range(len(seq_sizes)):
+                    embedding = list(ptr[i * n_embd : (i + 1) * n_embd])
+                    data.append(embedding)
+
         for i in range(len(text_tokens)):
             n_tokens = len(text_tokens[i])
             tokens = text_tokens[i]
             total_tokens += n_tokens
 
-            # check for overrun
             if n_tokens > n_batch:
-                raise ValueError(
-                    f"Requested tokens ({n_tokens}) exceed batch size of {n_batch}"
-                )
+                raise ValueError(f"Requested tokens ({n_tokens}) exceed batch size of {n_batch}")
 
-            # time to eval batch
-            if self._batch.n_tokens() + n_tokens > n_batch:
-                embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd), ctypes.POINTER(ctypes.c_float))
+            # flush batch if adding this sequence would exceed token capacity or n_seq_max
+            if self._batch.n_tokens() > 0 and (self._batch.n_tokens() + n_tokens > n_batch or p_batch >= n_seq_max):
+                embeddings_ptr = ctypes.cast(
+                    ctypes.byref(c_embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd),
+                    ctypes.POINTER(ctypes.c_float))
                 if not llama_batch_decode(self._ctx.ctx, self._batch.batch, p_batch, n_embd, n_norm, embeddings_ptr):
-                    raise RuntimeError("llama_batch_decode return false")
+                    raise RuntimeError(
+                        f"llama_batch_decode failed (n_tokens={self._batch.n_tokens()}, n_seq={p_batch}, n_seq_max={n_seq_max}). "
+                        f"Try increasing n_seq_max or reducing batch size.")
                 decode_batch(s_batch, embeddings_ptr)
                 embd_offset += self._batch.n_tokens() if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE else p_batch
                 self._batch.reset()
                 s_batch = []
                 p_batch = 0
 
-            # add to batch
             self._batch.add_sequence(tokens, p_batch, True)
-
-            # update batch stats
             s_batch.append(n_tokens)
             p_batch += 1
 
-        # hanlde last batch
-        embeddings_ptr = ctypes.cast(ctypes.byref(embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd), ctypes.POINTER(ctypes.c_float))
-        if not llama_batch_decode(
-            self._ctx.ctx, self._batch.batch, p_batch, n_embd, n_norm, embeddings_ptr
-        ):
-            raise RuntimeError("llama_batch_decode return false")
-        decode_batch(s_batch, embeddings_ptr)
+        # flush remaining
+        if self._batch.n_tokens() > 0:
+            embeddings_ptr = ctypes.cast(
+                ctypes.byref(c_embeddings, ctypes.sizeof(ctypes.c_float) * embd_offset * n_embd),
+                ctypes.POINTER(ctypes.c_float))
+            if not llama_batch_decode(self._ctx.ctx, self._batch.batch, p_batch, n_embd, n_norm, embeddings_ptr):
+                raise RuntimeError(
+                    f"llama_batch_decode failed (n_tokens={self._batch.n_tokens()}, n_seq={p_batch}, n_seq_max={n_seq_max}). "
+                    f"Try increasing n_seq_max or reducing batch size.")
+            decode_batch(s_batch, embeddings_ptr)
         self._batch.reset()
 
         if self.verbose:
@@ -1149,6 +1161,91 @@ class Llama:
 
         output = data[0] if isinstance(input, str) else data
 
+        self.reset()
+
+        if return_count:
+            return output, total_tokens
+        else:
+            return output
+
+    def _embed_debug(
+        self,
+        input: Union[str, List[str]],
+        normalize: bool = False,
+        truncate: bool = True,
+        return_count: bool = False,
+    ):
+        """Debug fallback for embed() using Python llama_decode + llama_get_embeddings_seq.
+        Does not require llama-embedding DLL. Processes one sequence at a time.
+        Only works with n_seq_max=1 (default)."""
+        import math
+
+        n_embd = self.n_embd()
+        n_batch = self.n_batch
+        pooling_type = self.pooling_type()
+
+        if self.context_params.embeddings is False:
+            raise RuntimeError("Llama model must be created with embedding=True")
+
+        if isinstance(input, str):
+            inputs = [input]
+        else:
+            inputs = input
+
+        text_tokens = []
+        for text in inputs:
+            tokens = self.tokenize(text.encode("utf-8"), add_bos=False)
+            if truncate:
+                tokens = tokens[:n_batch]
+            text_tokens.append(tokens)
+
+        data: List[List[float]] = []
+        total_tokens = 0
+
+        for tokens in text_tokens:
+            n_tokens = len(tokens)
+            total_tokens += n_tokens
+
+            if n_tokens > n_batch:
+                raise ValueError(f"Requested tokens ({n_tokens}) exceed batch size of {n_batch}")
+
+            mem = llama_cpp.llama_get_memory(self._ctx.ctx)
+            if mem is not None:
+                llama_cpp.llama_memory_clear(mem, True)
+
+            self._batch.reset()
+            self._batch.add_sequence(tokens, 0, True)
+
+            ret = llama_cpp.llama_decode(self._ctx.ctx, self._batch.batch)
+            if ret != 0:
+                raise RuntimeError(f"llama_decode failed with error code {ret}")
+
+            if pooling_type == llama_cpp.LLAMA_POOLING_TYPE_NONE:
+                token_embeddings: List[List[float]] = []
+                for j in range(n_tokens):
+                    emb_ptr = llama_cpp.llama_get_embeddings_ith(self._ctx.ctx, j)
+                    if emb_ptr is None:
+                        raise RuntimeError(f"llama_get_embeddings_ith returned NULL for token {j}")
+                    embedding = list(emb_ptr[:n_embd])
+                    if normalize:
+                        norm = math.sqrt(sum(x * x for x in embedding))
+                        if norm > 0:
+                            embedding = [x / norm for x in embedding]
+                    token_embeddings.append(embedding)
+                data.append(token_embeddings)
+            else:
+                emb_ptr = llama_cpp.llama_get_embeddings_seq(self._ctx.ctx, 0)
+                if emb_ptr is None:
+                    raise RuntimeError("llama_get_embeddings_seq returned NULL for seq_id 0")
+                embedding = list(emb_ptr[:n_embd])
+                if normalize:
+                    norm = math.sqrt(sum(x * x for x in embedding))
+                    if norm > 0:
+                        embedding = [x / norm for x in embedding]
+                data.append(embedding)
+
+        self._batch.reset()
+        output = data[0] if isinstance(input, str) else data
         self.reset()
 
         if return_count:
@@ -2133,7 +2230,7 @@ class Llama:
             logits_all=self._logits_all,
             embedding=self.context_params.embeddings,
             offload_kqv=self.context_params.offload_kqv,
-            flash_attn=self.context_params.flash_attn,
+            flash_attn=bool(self.context_params.flash_attn_type),
             op_offload=self.context_params.op_offload,
             swa_full=self.context_params.swa_full,
             # Sampling Params
