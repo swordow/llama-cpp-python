@@ -14,7 +14,7 @@ from llama_cpp.llama_types import List
 class BaseLlamaTokenizer(abc.ABC):
     @abc.abstractmethod
     def tokenize(
-        self, text: bytes, add_bos: bool = True, special: bool = True
+        self, text: bytes, add_bos: bool = True, special: bool = True, add_eos: Optional[bool] = None
     ) -> List[int]:
         """Tokenize the text into tokens.
 
@@ -22,6 +22,9 @@ class BaseLlamaTokenizer(abc.ABC):
             text: The utf-8 encoded string to tokenize.
             add_bos: Whether to add a beginning of sequence token.
             special: Whether to tokenize special tokens.
+            add_eos: Whether to add an end of sequence token. When None,
+                add_bos maps to C API's add_special (backward compatible).
+                When explicitly set, add_bos and add_eos are handled separately.
         """
         raise NotImplementedError
 
@@ -47,9 +50,9 @@ class LlamaTokenizer(BaseLlamaTokenizer):
         self._model = llama._model  # type: ignore
 
     def tokenize(
-        self, text: bytes, add_bos: bool = True, special: bool = True
+        self, text: bytes, add_bos: bool = True, special: bool = True, add_eos: Optional[bool] = None
     ) -> List[int]:
-        return self._model.tokenize(text, add_bos=add_bos, special=special)
+        return self._model.tokenize(text, add_bos=add_bos, special=special, add_eos=add_eos)
 
     def detokenize(
         self,
@@ -60,10 +63,10 @@ class LlamaTokenizer(BaseLlamaTokenizer):
         return self._model.detokenize(tokens, special=special)
 
     def encode(
-        self, text: str, add_bos: bool = True, special: bool = True
+        self, text: str, add_bos: bool = True, special: bool = True, add_eos: Optional[bool] = None
     ) -> List[int]:
         return self.tokenize(
-            text.encode("utf-8", errors="ignore"), add_bos=add_bos, special=special
+            text.encode("utf-8", errors="ignore"), add_bos=add_bos, special=special, add_eos=add_eos
         )
 
     def decode(self, tokens: List[int]) -> str:

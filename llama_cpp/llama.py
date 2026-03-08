@@ -582,7 +582,7 @@ class Llama:
         )
 
     def tokenize(
-        self, text: bytes, add_bos: bool = True, special: bool = False
+        self, text: bytes, add_bos: bool = True, special: bool = False, add_eos: Optional[bool] = None
     ) -> List[int]:
         """Tokenize a string.
 
@@ -590,6 +590,9 @@ class Llama:
             text: The utf-8 encoded string to tokenize.
             add_bos: Whether to add a beginning of sequence token.
             special: Whether to tokenize special tokens.
+            add_eos: Whether to add an end of sequence token. When None,
+                add_bos maps to C API's add_special (backward compatible).
+                When explicitly set, add_bos and add_eos are handled separately.
 
         Raises:
             RuntimeError: If the tokenization failed.
@@ -597,7 +600,7 @@ class Llama:
         Returns:
             A list of tokens.
         """
-        return self.tokenizer_.tokenize(text, add_bos, special)
+        return self.tokenizer_.tokenize(text, add_bos, special, add_eos=add_eos)
 
     def detokenize(
         self,
@@ -1076,9 +1079,13 @@ class Llama:
             inputs = input
 
         # tokenize all inputs
+        # Use separate add_bos/add_eos: model config controls which specials to add.
+        # Qwen3-Embedding: add_bos_token=false, add_eos_token=true (EOS needed for lasttoken pooling).
+        model_add_bos = self._model.add_bos_token()
+        model_add_eos = self._model.add_eos_token()
         text_tokens = []
         for text in inputs:
-            tokens = self.tokenize(text.encode("utf-8"), add_bos=False)
+            tokens = self.tokenize(text.encode("utf-8"), add_bos=model_add_bos, add_eos=model_add_eos)
             if truncate:
                 tokens = tokens[:n_batch]
             text_tokens.append(tokens)
@@ -1192,9 +1199,11 @@ class Llama:
         else:
             inputs = input
 
+        model_add_bos = self._model.add_bos_token()
+        model_add_eos = self._model.add_eos_token()
         text_tokens = []
         for text in inputs:
-            tokens = self.tokenize(text.encode("utf-8"), add_bos=False)
+            tokens = self.tokenize(text.encode("utf-8"), add_bos=model_add_bos, add_eos=model_add_eos)
             if truncate:
                 tokens = tokens[:n_batch]
             text_tokens.append(tokens)

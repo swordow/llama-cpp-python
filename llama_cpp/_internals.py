@@ -162,23 +162,52 @@ class LlamaModel:
 
     # Tokenization
 
-    def tokenize(self, text: bytes, add_bos: bool, special: bool):
-        n_ctx = self.n_ctx_train()
-        tokens = (llama_cpp.llama_token * n_ctx)()
-        n_tokens = llama_cpp.llama_tokenize(
-            self.vocab, text, len(text), tokens, n_ctx, add_bos, special
-        )
-        if n_tokens < 0:
-            n_tokens = abs(n_tokens)
-            tokens = (llama_cpp.llama_token * n_tokens)()
+    def tokenize(self, text: bytes, add_bos: bool, special: bool, add_eos: "Optional[bool]" = None):
+        if add_eos is None:
+            # Backward compatible: add_bos maps directly to C API's add_special
+            n_ctx = self.n_ctx_train()
+            tokens = (llama_cpp.llama_token * n_ctx)()
             n_tokens = llama_cpp.llama_tokenize(
-                self.vocab, text, len(text), tokens, n_tokens, add_bos, special
+                self.vocab, text, len(text), tokens, n_ctx, add_bos, special
             )
             if n_tokens < 0:
-                raise RuntimeError(
-                    f'Failed to tokenize: text="{text}" n_tokens={n_tokens}'
+                n_tokens = abs(n_tokens)
+                tokens = (llama_cpp.llama_token * n_tokens)()
+                n_tokens = llama_cpp.llama_tokenize(
+                    self.vocab, text, len(text), tokens, n_tokens, add_bos, special
                 )
-        return list(tokens[:n_tokens])
+                if n_tokens < 0:
+                    raise RuntimeError(
+                        f'Failed to tokenize: text="{text}" n_tokens={n_tokens}'
+                    )
+            return list(tokens[:n_tokens])
+        else:
+            # Separate add_bos/add_eos: tokenize without specials, then add manually
+            n_ctx = self.n_ctx_train()
+            tokens = (llama_cpp.llama_token * n_ctx)()
+            n_tokens = llama_cpp.llama_tokenize(
+                self.vocab, text, len(text), tokens, n_ctx, False, special
+            )
+            if n_tokens < 0:
+                n_tokens = abs(n_tokens)
+                tokens = (llama_cpp.llama_token * n_tokens)()
+                n_tokens = llama_cpp.llama_tokenize(
+                    self.vocab, text, len(text), tokens, n_tokens, False, special
+                )
+                if n_tokens < 0:
+                    raise RuntimeError(
+                        f'Failed to tokenize: text="{text}" n_tokens={n_tokens}'
+                    )
+            result = list(tokens[:n_tokens])
+            if add_bos:
+                bos_id = self.token_bos()
+                if bos_id >= 0:
+                    result.insert(0, bos_id)
+            if add_eos:
+                eos_id = self.token_eos()
+                if eos_id >= 0:
+                    result.append(eos_id)
+            return result
 
     def token_to_piece(self, token: int, special: bool = False) -> bytes:
         buf = ctypes.create_string_buffer(32)
