@@ -205,6 +205,7 @@ class Llama:
         set_verbose(verbose)
 
         if not Llama.__backend_initialized:
+            llama_cpp.load_backends()
             with suppress_stdout_stderr(disable=verbose):
                 llama_cpp.llama_backend_init()
             Llama.__backend_initialized = True

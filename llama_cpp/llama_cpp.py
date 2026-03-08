@@ -37,6 +37,77 @@ _base_path = pathlib.Path(os.path.abspath(os.path.dirname(__file__))) / "lib" if
 # Load the library
 _lib = load_shared_library(_lib_base_name, _base_path)
 
+# Backend loading support
+_backends_loaded = False
+_cuda_disabled = False
+
+def load_backends(disable_cuda: bool = False):
+    """Load ggml backend DLLs from the lib directory (GGML_BACKEND_DL=ON builds).
+
+    With dynamic backend loading, CPU/CUDA backends are compiled as separate
+    DLLs (e.g. ggml-cpu-alderlake.dll, ggml-cuda.dll). This function scans
+    the lib directory and calls ggml_backend_load() for each matching DLL
+    to register them with the ggml backend registry.
+
+    This function is process-global and idempotent — only the first call
+    actually loads backends. Subsequent calls are no-ops. If a subsequent
+    call passes a different disable_cuda value, a warning is emitted because
+    backend loading cannot be undone (CUDA context persists until process exit).
+
+    Typical usage:
+        # At process startup, before any Llama instance:
+        from llama_cpp import llama_cpp
+        llama_cpp.load_backends(disable_cuda=True)   # pure CPU mode
+
+        # Or let Llama.__init__ call it with defaults (CUDA enabled):
+        llama_cpp.load_backends()  # called automatically on first Llama()
+
+    Args:
+        disable_cuda: If True, skip loading ggml-cuda.dll so the CUDA
+            backend is never registered. All computation will use CPU
+            backends only. This is useful when:
+            - The GPU (e.g. T400 4GB) is slower than the CPU for the workload
+            - n_gpu_layers=0 but the CUDA scheduler still intercepts compute
+            - You want to avoid CUDA context initialization overhead
+            Default is False (load all available backends including CUDA).
+
+    Notes:
+        - For statically-linked builds (GGML_BACKEND_DL=OFF), this function
+          has no effect — backends are compiled into the main library.
+        - The function loads ggml.dll to access ggml_backend_load(). If
+          ggml.dll is not found, a warning is emitted and loading is skipped.
+        - On Linux, .so files are scanned in addition to .dll files.
+    """
+    global _backends_loaded, _cuda_disabled
+    if _backends_loaded:
+        if disable_cuda != _cuda_disabled:
+            import warnings
+            warnings.warn(
+                f"load_backends: disable_cuda={disable_cuda} requested but backends already loaded with disable_cuda={_cuda_disabled}. "
+                f"Backend loading is process-global and determined by the first call.",
+                stacklevel=3,
+            )
+        return
+    _backends_loaded = True
+    _cuda_disabled = disable_cuda
+    try:
+        import glob as _glob
+        _lib_ggml = load_shared_library("ggml", _base_path)
+        _lib_ggml.ggml_backend_load.argtypes = [ctypes.c_char_p]
+        _lib_ggml.ggml_backend_load.restype = ctypes.c_bool
+        for _dll in sorted(_glob.glob(str(_base_path / "ggml-*.dll"))) + sorted(_glob.glob(str(_base_path / "ggml-*.so"))):
+            _dll_name = os.path.basename(_dll).lower()
+            if disable_cuda and "cuda" in _dll_name:
+                continue
+            _lib_ggml.ggml_backend_load(_dll.encode("utf-8"))
+    except Exception as e:
+        import warnings
+        warnings.warn(
+            f"load_backends: failed to load ggml backends: {e}. "
+            f"If using a statically-linked build, this is expected.",
+            stacklevel=2,
+        )
+
 ctypes_function = ctypes_function_for_shared_library(_lib)
 
 

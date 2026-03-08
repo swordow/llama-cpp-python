@@ -67,9 +67,11 @@ def load_shared_library(lib_base_name: str, base_path: pathlib.Path):
             os.add_dll_directory(os.path.join(os.environ["HIP_PATH"], "lib"))
         cdll_args["winmode"] = ctypes.RTLD_GLOBAL
 
-    # On Windows, preload dependency DLLs from base_path to resolve transitive deps
+    # On Windows, preload direct dependency DLLs for llama.dll.
+    # With GGML_BACKEND_DL=ON, backend DLLs (ggml-cpu*.dll, ggml-cuda.dll)
+    # are loaded dynamically via load_backends(), not preloaded here.
     if sys.platform == "win32":
-        _dep_load_order = ["ggml.dll", "ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll"]
+        _dep_load_order = ["ggml.dll", "ggml-base.dll"]
         for dep_name in _dep_load_order:
             dep_path = base_path / dep_name
             if dep_path.exists():
