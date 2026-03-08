@@ -82,11 +82,26 @@ class LlamaHFTokenizer(BaseLlamaTokenizer):
         self.hf_tokenizer = hf_tokenizer
 
     def tokenize(
-        self, text: bytes, add_bos: bool = True, special: bool = True
+        self, text: bytes, add_bos: bool = True, special: bool = True, add_eos: Optional[bool] = None
     ) -> List[int]:
-        return self.hf_tokenizer.encode(
-            text.decode("utf-8", errors="ignore"), add_special_tokens=special
-        )
+        if add_eos is None:
+            return self.hf_tokenizer.encode(
+                text.decode("utf-8", errors="ignore"), add_special_tokens=special
+            )
+        else:
+            # Separate add_bos/add_eos: tokenize without specials, then add manually
+            tokens = self.hf_tokenizer.encode(
+                text.decode("utf-8", errors="ignore"), add_special_tokens=False
+            )
+            if add_bos:
+                bos_id = self.hf_tokenizer.bos_token_id
+                if bos_id is not None:
+                    tokens.insert(0, bos_id)
+            if add_eos:
+                eos_id = self.hf_tokenizer.eos_token_id
+                if eos_id is not None:
+                    tokens.append(eos_id)
+            return tokens
 
     def detokenize(
         self,

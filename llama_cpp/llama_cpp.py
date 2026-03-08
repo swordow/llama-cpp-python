@@ -95,11 +95,16 @@ def load_backends(disable_cuda: bool = False):
         _lib_ggml = load_shared_library("ggml", _base_path)
         _lib_ggml.ggml_backend_load.argtypes = [ctypes.c_char_p]
         _lib_ggml.ggml_backend_load.restype = ctypes.c_bool
-        for _dll in sorted(_glob.glob(str(_base_path / "ggml-*.dll"))) + sorted(_glob.glob(str(_base_path / "ggml-*.so"))):
+        for _dll in sorted(_glob.glob(str(_base_path / "ggml-*.dll"))) + sorted(_glob.glob(str(_base_path / "ggml-*.so"))) + sorted(_glob.glob(str(_base_path / "ggml-*.dylib"))):
             _dll_name = os.path.basename(_dll).lower()
             if disable_cuda and "cuda" in _dll_name:
                 continue
-            _lib_ggml.ggml_backend_load(_dll.encode("utf-8"))
+            if not _lib_ggml.ggml_backend_load(_dll.encode("utf-8")):
+                import warnings
+                warnings.warn(
+                    f"load_backends: failed to load backend: {_dll_name}",
+                    stacklevel=2,
+                )
     except Exception as e:
         import warnings
         warnings.warn(
