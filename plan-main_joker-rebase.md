@@ -259,17 +259,227 @@ Bug #4 在 `_create_completion()` 方法中，与 `embed()` 完全无关。分�
 
 ---
 
-## 六、执行结果
+## 六、llama_cpp.py 与 llamacpp_joker_2026.01 接口兼容性分析
 
-见 git log：
+**分析日期**: 2026-03-08
+
+### 背景
+
+用户提出："llama-cpp-python 的最新 main 分支对应的 vendor 内的 llama.cpp 使用的分支似乎不是最新的"。需要验证 `llama-cpp-python/main_joker` 分支与 `llama.cpp/llamacpp_joker_2026.01` 分支（两个 joker 分支配对使用）的接口兼容性。
+
+### 分析过程
+
+**第一步：确认各分支 vendor 子模块指向的 llama.cpp commit**
+
 ```
-git log --oneline -4
+旧版 main_joker (43efedb) vendor → 7841fc72 (llama: Add Gemma 3 support, PR #12343)
+    所在分支: llamacpp_joker, llamacpp_joker_2026.01, master
+
+最新 main (c37132b) vendor      → 4227c9be (CUDA: fix negative KV_max values, PR #15321)
+    所在分支: llamacpp_joker_2026.01, master
 ```
 
-预期：
+**第二步：确认 `llamacpp_joker_2026.01` 的 upstream 基点**
+
 ```
-<hash3> fix: llama_cpp embed() method bug fixes
-<hash2> fix: prompt_tokens duplicate BOS removal assignment
-<hash1> mod: rebase main_joker onto latest main
-<c37132b> chore: Bump version  ← latest main
+llamacpp_joker_2026.01 upstream base → a0ed91a44 (models: kda chunk size = 16, PR #19827)
+llamacpp_joker_2026.01 HEAD         → 261e0e5ad (base + 11 个自定义 commits)
+```
+
+**第三步：确认版本差距**
+
+```
+llama.cpp commits 时间线：
+
+7841fc72 (#12343)  ← 旧版 main_joker (43efedb) vendor
+    ↓ +1295 commits
+4227c9be (#15321)  ← 最新 llama-cpp-python/main (c37132b) vendor
+    ↓ +2041 commits
+a0ed91a44 (#19827) ← llamacpp_joker_2026.01 upstream base
+    ↓ +11 自定义 commits
+261e0e5ad          ← llamacpp_joker_2026.01 HEAD
+```
+
+**结论：`llama_cpp.py` 适配的 llama.cpp 版本（`4227c9be`，PR #15321）与 `llamacpp_joker_2026.01` 的 upstream base（`a0ed91a44`，PR #19827）之间有 2041 个 commits 的差距。**
+
+旧版 `main_joker`（`43efedb`）在自定义 commit 中**未修改过 `llama_cpp.py`**（只改了 CMakeLists.txt、llama.py、llama_embedding.py），说明旧版也没有适配过这个版本差距——旧版 `main_joker` 当时配合的是更早的 `llamacpp_joker` 分支（vendor `7841fc72`），不是 `llamacpp_joker_2026.01`。
+
+rebase 到最新 main 后，vendor 从 `7841fc72` 更新到了 `4227c9be`（拉近了 1295 个 commits），但距离 `llamacpp_joker_2026.01` 的 base 仍有 **2041 个 commits 的 API 差距**。
+
+**第四步：识别 `llama_cpp.py` 的 API 覆盖缺口**
+
+`llama_cpp.py` 是 Python ctypes 绑定文件，需要与实际 DLL 导出的函数名和签名一致。做双向 diff：
+
+```bash
+# 从 llamacpp_joker_2026.01 的 llama.h 提取所有 LLAMA_API 函数名
+grep -oE "llama_[a-z_]+" llama.cpp/include/llama.h | sort -u > c_api.txt
+
+# 从 llama_cpp.py 提取所有绑定函数名
+grep -oE '"llama_[a-z_]+"' llama_cpp/llama_cpp.py | tr -d '"' | sort -u > py_api.txt
+
+# 双向比较
+comm -23 c_api.txt py_api.txt   → llama.h 有但 py 没绑定（48 个）
+comm -13 c_api.txt py_api.txt   → py 绑定了但 llama.h 没有（22 个）
+```
+
+**第五步：判断哪些缺失会导致运行时错误**
+
+22 个"py 有但 llama.h 没有"的函数中，大部分是 KV cache 旧 API 的 deprecated 绑定（`llama_kv_self_*`），`_internals.py` 已经切换到新 API，不会被调用。
+
+关键问题：ctypes 的 `getattr(lib, name)` 是否懒加载？
+
+```python
+# _ctypes_extensions.py:112
+func = getattr(lib, name)   # ← 模块加载时执行
+func.argtypes = argtypes
+func.restype = restype
+```
+
+`ctypes.CDLL` 的 `getattr` 是懒加载：返回一个函数包装对象，不立即解析 DLL 符号。只有实际调用 `func()` 时才会查找符号。因此绑定了不存在的函数名不会导致 import 失败，仅调用时崩溃。
+
+**第六步：交叉引用实际调用路径**
+
+遍历 22 个不存在的函数，在 `llama.py`、`_internals.py`、`llama_chat_format.py` 中搜索调用：
+
+```bash
+for func in llama_kv_self_clear llama_set_adapter_lora llama_sampler_init_softmax ...; do
+  grep -rn "$func" llama_cpp/ --include="*.py" | grep -v "llama_cpp.py"
+done
+```
+
+只有两个函数在非 `llama_cpp.py` 文件中被实际调用：
+1. `llama_set_adapter_lora` → `llama.py:435`（LoRA 加载路径）
+2. `llama_sampler_init_softmax` → `_internals.py:676`（负温度采样路径）
+
+其余 20 个都是死代码。
+
+### 方法
+
+提取 `llamacpp_joker_2026.01` 的 `include/llama.h` 中所有 `LLAMA_API` 导出函数名，与 `llama_cpp.py` 中所有 ctypes 绑定函数名做双向 diff。再交叉引用 `llama.py`、`_internals.py`、`llama_chat_format.py` 中的实际调用，判断每个差异是否会导致运行时错误。
+
+### 结果 1: 已正确适配的接口
+
+| 接口 | 说明 |
+|------|------|
+| KV Cache API | `_internals.py` 已全面切换到 `llama_memory_*` 新 API（`llama_get_memory`、`llama_memory_clear`、`llama_memory_seq_rm` 等），旧 `llama_kv_self_*` 绑定是死代码 |
+| `llama_batch_decode` | `llama_embedding.py` 独立绑定自定义 DLL，不依赖 `llama_cpp.py` |
+| `embed()` KV 清理 | 本次 rebase 已移除 `llama_kv_cache_clear` 调用 |
+| 核心推理 API | `llama_decode`、`llama_model_load_from_file`、`llama_init_from_model`、`llama_get_embeddings_seq`、`llama_pooling_type`、`llama_perf_context_*` 等全部在新 llama.h 中存在 |
+| `llama_chat_format.py` | 内部调用 `llama._ctx.kv_cache_clear()` → `_internals.py` → `llama_memory_clear`（新 API） |
+
+### 结果 2: 破坏性不兼容（运行时会崩溃）
+
+#### 不兼容 #1: `llama_sampler_init_softmax` — 完全移除
+
+- **llama_cpp.py**: `llama_cpp.py:3809` 绑定了 `"llama_sampler_init_softmax"`
+- **新 llama.h**: 该函数完全不存在（连 DEPRECATED 都没有，源码中也无此符号）
+- **调用链**: `llama.py:754`（`temp < 0.0` 时）→ `_internals.py:676` `add_softmax()` → `llama_cpp.llama_sampler_init_softmax()`
+- **触发条件**: 使用负温度采样（`temperature < 0`）
+- **影响**: ctypes 调用不存在的 DLL 符号，运行时崩溃
+
+#### 不兼容 #2: `llama_set_adapter_lora` — 改名 + 签名变更
+
+- **llama_cpp.py**: `llama_cpp.py:1739` 绑定了 `"llama_set_adapter_lora"`
+- **新 llama.h**: 改为 `llama_set_adapters_lora`（注意复数 `s`），且签名从单 adapter 改为 adapter 数组：
+  ```c
+  // 旧签名（已移除）
+  int32_t llama_set_adapter_lora(ctx, adapter, scale)
+  // 新签名
+  int32_t llama_set_adapters_lora(ctx, adapters[], n_adapters, scales[])
+  ```
+- **调用链**: `llama.py:435`（构造函数中 `lora_path` 非空时）
+- **触发条件**: 加载 LoRA adapter
+- **影响**: ctypes 调用不存在的 DLL 符号，运行时崩溃
+
+### 结果 3: llama_cpp.py 中绑定了但新 llama.h 中已不存在的函数（死代码）
+
+以下函数在 `llama_cpp.py` 中有 ctypes 绑定，但新 `llama.h` 中不存在。由于 ctypes 懒加载特性（`getattr(lib, name)` 不立即解析符号），这些绑定在 import 时不会报错，仅在实际调用时才会崩溃。经确认，`_internals.py` 和 `llama.py` 的正常代码路径不会调用这些函数。
+
+```
+llama_kv_self_clear           → 替代: llama_memory_clear (已适配)
+llama_kv_self_seq_rm          → 替代: llama_memory_seq_rm (已适配)
+llama_kv_self_seq_add         → 替代: llama_memory_seq_add (已适配)
+llama_kv_self_seq_cp          → 替代: llama_memory_seq_cp (已适配)
+llama_kv_self_seq_div         → 替代: llama_memory_seq_div (已适配)
+llama_kv_self_seq_keep        → 替代: llama_memory_seq_keep (已适配)
+llama_kv_self_seq_pos_max     → 替代: llama_memory_seq_pos_max (已适配)
+llama_kv_self_seq_pos_min     → 替代: llama_memory_seq_pos_min (已适配)
+llama_kv_self_can_shift       → 替代: llama_memory_can_shift (已适配)
+llama_kv_self_defrag          → 无直接替代 (未被调用)
+llama_kv_self_update          → 无直接替代 (未被调用)
+llama_kv_self_n_tokens        → 无直接替代 (未被调用)
+llama_kv_self_used_cells      → 无直接替代 (未被调用)
+llama_get_kv_self             → 替代: llama_get_memory (已适配)
+llama_apply_adapter_cvec      → 替代: llama_set_adapter_cvec
+llama_clear_adapter_lora      → 已移除
+llama_rm_adapter_lora         → 已移除
+llama_sampler_init_softmax    → 已移除 ← 但实际被调用！见不兼容 #1
+llama_set_adapter_lora        → 替代: llama_set_adapters_lora ← 实际被调用！见不兼容 #2
+```
+
+### 结果 4: 新 llama.h 有但 llama_cpp.py 未绑定的函数（48 个）
+
+这些是 `llamacpp_joker_2026.01` 新增或改名的函数，`llama_cpp.py` 尚未提供绑定。当前使用场景不需要这些函数，但列出以供未来参考：
+
+```
+llama_attach_threadpool / llama_detach_threadpool    — 线程池管理
+llama_decode_with_sampler                            — 带采样器的解码
+llama_get_pooling_type                               — llama_pooling_type 的新名（旧名仍可用）
+llama_get_sampled_*                                  — 采样细节分析（6 个函数）
+llama_set_adapters_lora                              — LoRA 数组接口（替代 llama_set_adapter_lora）
+llama_set_adapter_cvec                               — 控制向量接口（替代 llama_apply_adapter_cvec）
+llama_sampler_init_adaptive_p                        — 自适应 p 采样器
+llama_model_is_hybrid                                — 混合模型检测
+llama_model_n_embd_inp / llama_model_n_embd_out      — 输入/输出 embedding 维度
+llama_n_ctx_seq                                      — 每序列上下文长度
+llama_memory_breakdown_print                         — 内存分布打印
+llama_state_seq_*_ext                                — 扩展状态序列化
+llama_params_fit / llama_params_fit_status            — 参数适配
+llama_flash_attn_type / llama_flash_attn_type_name   — Flash Attention 类型
+llama_rope_type                                      — RoPE 类型
+llama_log_get                                        — 日志获取
+... 其他 struct/type 定义
+```
+
+### 潜在风险
+
+`llama_pooling_type` 在新 llama.h 中标有 `// TODO: rename to llama_get_pooling_type`。当前旧名仍保留，但如果未来某版本完成重命名并删除旧名，`_internals.py:287` 的调用会崩溃。
+
+### 修复建议
+
+| 不兼容 | 修复方案 | 优先级 |
+|--------|----------|--------|
+| #1 `llama_sampler_init_softmax` | 确认新版本中负温度采样的替代实现，更新 `llama_cpp.py` 绑定和 `_internals.py` 调用 | 高（影响 LLM 推理） |
+| #2 `llama_set_adapter_lora` | 在 `llama_cpp.py` 添加 `llama_set_adapters_lora` 绑定（数组签名），修改 `llama.py:435` 调用方式 | 中（仅影响 LoRA 用户） |
+
+---
+
+## 七、执行结果
+
+### Rebase + Bug 修复（2026-03-07）
+
+已完成 rebase 和 bug 修复，commit 结构见 git log。
+
+### 兼容性修复（2026-03-08）
+
+对两个 joker 分支做了全面 API 兼容性对比后，修复了 2 个运行时崩溃的破坏性不兼容：
+
+**Commit `8bb5a67`**: `fix: adapt llama_cpp.py bindings for llamacpp_joker_2026.01 compatibility`
+
+| 不兼容 | 修复内容 | 涉及文件 |
+|--------|----------|----------|
+| #1 `llama_sampler_init_softmax` 移除 | 删除 `add_softmax()` 方法和 ctypes 绑定，`temp <= 0` 统一改为 `add_greedy()`（与新版 llama.cpp 行为一致：`llama_sampler_temp_impl` 对 `temp <= 0` 贪心采样） | `llama_cpp.py`、`_internals.py`、`llama.py` |
+| #2 `llama_set_adapter_lora` → `llama_set_adapters_lora` | 更新 ctypes 绑定为新的数组签名（`adapters[]`, `n_adapters`, `scales[]`），调用处构造单元素数组适配 | `llama_cpp.py`、`llama.py` |
+
+已 push 到 remote `origin/main_joker`。
+
+### 当前 commit 结构
+
+```
+8bb5a67 fix: adapt llama_cpp.py bindings for llamacpp_joker_2026.01 compatibility
+c775713 fix: LlamaHFTokenizer add_eos + load_backends improvements
+1becff5 feat: dynamic backend loading + disable_cuda + CMake embedding decoupling
+dfc4310 feat: separate add_bos/add_eos parameters in tokenize API
+358528c fix: update Python bindings for new llama.cpp API
+373bfc6 mod: update llama.cpp.
 ```
