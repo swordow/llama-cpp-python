@@ -95,14 +95,27 @@ def load_backends(disable_cuda: bool = False):
         _lib_ggml = load_shared_library("ggml", _base_path)
         _lib_ggml.ggml_backend_load.argtypes = [ctypes.c_char_p]
         _lib_ggml.ggml_backend_load.restype = ctypes.c_bool
+        # Non-backend libraries that match ggml-* glob but are not backend plugins
+        _skip_libs = {"ggml-base"}
         for _dll in sorted(_glob.glob(str(_base_path / "ggml-*.dll"))) + sorted(_glob.glob(str(_base_path / "ggml-*.so"))) + sorted(_glob.glob(str(_base_path / "ggml-*.dylib"))):
             _dll_name = os.path.basename(_dll).lower()
+            _dll_stem = _dll_name.rsplit(".", 1)[0]  # "ggml-cpu-alderlake.dll" -> "ggml-cpu-alderlake"
+            if _dll_stem in _skip_libs:
+                continue
             if disable_cuda and "cuda" in _dll_name:
                 continue
             if not _lib_ggml.ggml_backend_load(_dll.encode("utf-8")):
                 import warnings
+                import re as _re
+                # Infer failure reason from DLL name pattern
+                if _re.match(r"ggml-cpu-\w+", _dll_stem):
+                    _reason = f"CPU does not support the required instruction set for this variant"
+                elif _dll_stem == "ggml-cpu":
+                    _reason = "base CPU dispatcher, not a standalone backend plugin"
+                else:
+                    _reason = "ggml_backend_load() returned false (missing ggml_backend_reg_init export or runtime check failed)"
                 warnings.warn(
-                    f"load_backends: failed to load backend: {_dll_name}",
+                    f"load_backends: skipping {_dll_name}: {_reason}",
                     stacklevel=2,
                 )
     except Exception as e:
