@@ -438,8 +438,10 @@ class Llama:
 
             self._stack.callback(free_lora_adapter)
 
-            if llama_cpp.llama_set_adapter_lora(
-                self._ctx.ctx, self._lora_adapter, self.lora_scale
+            adapters_arr = (llama_cpp.llama_adapter_lora_p_ctypes * 1)(self._lora_adapter)
+            scales_arr = (ctypes.c_float * 1)(self.lora_scale)
+            if llama_cpp.llama_set_adapters_lora(
+                self._ctx.ctx, adapters_arr, 1, scales_arr
             ):
                 raise RuntimeError(
                     f"Failed to set LoRA adapter from lora path: {self.lora_path}"
@@ -759,10 +761,7 @@ class Llama:
         if grammar is not None:
             sampler.add_grammar(self._model, grammar)
 
-        if temp < 0.0:
-            sampler.add_softmax()
-            sampler.add_dist(self._seed)
-        elif temp == 0.0:
+        if temp <= 0.0:
             sampler.add_greedy()
         else:
             if mirostat_mode == 1:

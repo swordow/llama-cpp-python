@@ -1795,22 +1795,24 @@ def llama_adapter_lora_free(adapter: llama_adapter_lora_p, /):
 # // The following functions operate on a llama_context, hence the naming: llama_verb_...
 
 
-# // Add a loaded LoRA adapter to given context
-# // This will not modify model's weight
-# LLAMA_API int32_t llama_set_adapter_lora(
+# // Set LoRa adapters on the context. Will only modify if the adapters currently in context are different.
+# LLAMA_API int32_t llama_set_adapters_lora(
 #         struct llama_context * ctx,
-#         struct llama_adapter_lora * adapter,
-#         float scale);
+#         struct llama_adapter_lora ** adapters,
+#         size_t n_adapters,
+#         float * scales);
 @ctypes_function(
-    "llama_set_adapter_lora",
-    [llama_context_p_ctypes, llama_adapter_lora_p_ctypes, ctypes.c_float],
+    "llama_set_adapters_lora",
+    [llama_context_p_ctypes, ctypes.POINTER(llama_adapter_lora_p_ctypes), ctypes.c_size_t, ctypes.POINTER(ctypes.c_float)],
     ctypes.c_int32,
 )
-def llama_set_adapter_lora(
-    ctx: llama_context_p, adapter: llama_adapter_lora_p, scale: float, /
+def llama_set_adapters_lora(
+    ctx: llama_context_p,
+    adapters: CtypesArray[llama_adapter_lora_p],
+    n_adapters: int,
+    scales: CtypesArray[ctypes.c_float], /,
 ) -> int:
-    """Add a loaded LoRA adapter to given context
-    This will not modify model's weight"""
+    """Set LoRa adapters on the context."""
     ...
 
 
@@ -3619,14 +3621,6 @@ def llama_sampler_init_greedy() -> llama_sampler_p:
 def llama_sampler_init_dist(seed: int) -> llama_sampler_p:
     ...
 
-
-# /// @details Sorts candidate tokens by their logits in descending order and calculate probabilities based on logits.
-# /// NOTE: Avoid using on the full vocabulary as the sorting can become slow. For example, apply top-k or top-p sampling first.
-# DEPRECATED(LLAMA_API struct llama_sampler * llama_sampler_init_softmax    (void),
-#     "will be removed in the future (see https://github.com/ggml-org/llama.cpp/pull/9896#discussion_r1800920915)");
-@ctypes_function("llama_sampler_init_softmax", [], llama_sampler_p_ctypes)
-def llama_sampler_init_softmax() -> llama_sampler_p:
-    ...
 
 
 # /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
